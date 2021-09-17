@@ -1,0 +1,117 @@
+name: CD Workflow Job Worker
+
+on:
+  workflow_dispatch: # Push when triggered manually
+    branches:
+      - BZLBUS-1592
+
+env:
+  COMPONENT_NAME: product-portal-api-worker # Must match the name of the repository at Container Registry
+  PHP_VERSION: 8.0 # Must match the PHP version running on the target k8s cluster
+  HELM_REPOSITORY: LexisNexis-RBA/helm-psd.product-portal-api-job-runner # Must match the name of the repository with Helm Charts for this microservice
+  ITAG: "" # Will be automatically filled
+
+jobs:
+  build:
+    runs-on: ubuntu-20.04
+    strategy:
+      fail-fast: false
+
+    # Only runs it when Pull Requests get merged into master branch
+    #if: github.event.pull_request.merged
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v2
+        with:
+          path: code
+
+      - name: Setup PHP with composer v2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mysql, bcmath, mongodb, soap, gd, json, dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, xmlwriter, xmlreader, xml, tokenizer, ctype, openssl, zlib, phar, session intl
+          tools: composer:v2
+
+      - name: Setup composer cache for next jobs
+        uses: actions/cache@v2
+        env:
+          cache-name: cache-composer
+        with:
+          path: code/vendor
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/composer.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-build-${{ env.cache-name }}-
+            ${{ runner.os }}-build-
+            ${{ runner.os }}-
+
+      - name: Install PHP dependencies
+        run: |
+          cd code
+          composer config http-basic.github.com "${{ secrets.HTTP_BASIC_USERNAME }}" "${{ secrets.HTTP_BASIC_TOKEN }}"
+          composer install --no-ansi --no-interaction --no-scripts --no-suggest --prefer-dist
+
+  push:
+    runs-on: ubuntu-20.04
+    needs: build
+    strategy:
+      fail-fast: false
+
+    # Only runs it when Pull Requests get merged into master branch
+    #if: github.event.pull_request.merged
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v2
+        with:
+          path: code
+
+      - name: Setup PHP with composer v2
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: ${{ env.PHP_VERSION }}
+          extensions: mysql, bcmath, mongodb, soap, gd, json, dom, curl, libxml, mbstring, zip, pcntl, pdo, sqlite, pdo_sqlite, xmlwriter, xmlreader, xml, tokenizer, ctype, openssl, zlib, phar, session intl
+          tools: composer:v2
+
+      - name: Restore composer cache
+        uses: actions/cache@v2
+        env:
+          cache-name: cache-composer
+        with:
+          path: code/vendor
+          key: ${{ runner.os }}-build-${{ env.cache-name }}-${{ hashFiles('**/composer.lock') }}
+
+      - name: Get container image tag
+        run: echo "ITAG=$(date +'%Y%m%d-%H%M%S')-$GITHUB_SHA" >> $GITHUB_ENV
+
+      - name: Authenticate at Container Registry
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.DOCKER_LOGIN_SERVER }}
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_PASSWORD }}
+
+      - name: Build and push image to Container Registry
+        run: |
+          cd code
+          docker build . --file docker_worker/Dockerfile -t ${{ secrets.DOCKER_LOGIN_SERVER }}/${{ env.COMPONENT_NAME }}:${{ env.ITAG }} --build-arg APP_VERSION=${{ env.ITAG }}
+          docker push ${{ secrets.DOCKER_LOGIN_SERVER }}/${{ env.COMPONENT_NAME }}:${{ env.ITAG }}
+
+      - name: Checkout to Helm repo for this microservice
+        uses: actions/checkout@v2
+        with:
+          repository: ${{ env.HELM_REPOSITORY }}
+          token: ${{ secrets.HTTP_BASIC_TOKEN }}
+          ref: develop # Branch 'develop' is synced to k8s of development subscription
+          path: helm
+
+      - name: Increment appVersion on Helm Chart
+        run: |
+          perl -pi -e 's!appVersion: (.*)!appVersion: ${{ env.ITAG }}!' helm/Chart.yaml
+
+      - name: Save Helm changes
+        run: |
+          cd helm
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add Chart.yaml
+          git commit -m "[Github Actions] Increase appVersion to ${{ env.ITAG }}"
+          git push
